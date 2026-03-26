@@ -1,0 +1,290 @@
+import pandas as pd
+import os
+import smtplib
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+from openpyxl import load_workbook, Workbook
+
+# --- CONFIGURATION ---
+BASE_DIR = r'D:\3) Monthly Task\Payout Calculation\Finance_Automation'
+
+INPUT_PAYMENT_SHEET = os.path.join(BASE_DIR, 'output_files', 'payment sheet.xlsx')
+RAW_DATA_FILE = os.path.join(BASE_DIR, 'input_files', 'compact_revenue_report.csv')
+PERIOD_FILE_PATH = os.path.join(BASE_DIR, 'input_files', 'Period.xlsx')
+
+SAP_TEMPLATE_PATH = os.path.join(BASE_DIR, 'Uploader format', 'Payment_format.xlsx')
+SAP_OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'sap_payment_uploader.xlsx')
+GOOGLE_UPLOADER_FILE = os.path.join(BASE_DIR, 'output_files', 'Google_Payment_Uploader.xlsx')
+
+JV_SOURCE_FILE = os.path.join(BASE_DIR, 'output_files', 'output.xlsx')
+MM_FILE = os.path.join(BASE_DIR, 'input_files', 'MM.csv')
+JV_FORMAT_FILE = os.path.join(BASE_DIR, 'Uploader format', 'JV_Uploader_format.xlsx')
+JV_OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'jv_uploader.xlsx')
+
+# Email Credentials
+SENDER_EMAIL = "harsh.rawat@paipai.mobi"
+SENDER_PASSWORD = "ryklyfoiqfkqyevv"
+RECEIVER_EMAIL = ["harsh.rawat@paipai.mobi", "gaurav43.kumar@paipai.mobi"]
+
+
+# ---------------- EMAIL SENDER ---------------- #
+def send_gmail(attachments):
+    try:
+        current_date = datetime.now().strftime('%d-%m-%Y')
+        subject = f"SAP + Google Payment uploader dated {current_date}"
+        body = f"Please find the attached SAP, Google & JV Payment Uploader files for {current_date}."
+
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ", ".join(RECEIVER_EMAIL)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        for attachment_path in attachments:
+            if os.path.exists(attachment_path):
+                filename = os.path.basename(attachment_path)
+                with open(attachment_path, "rb") as attachment:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f"attachment; filename={filename}")
+                    msg.attach(part)
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+        server.quit()
+
+        print("📧 Email sent successfully with SAP + Google + JV Uploader attached")
+
+    except Exception as e:
+        print(f"❌ Email sending error: {e}")
+
+
+# ---------------- SAP FILE CREATOR ---------------- #
+def generate_sap_upload():
+    try:
+        print("Starting SAP Uploader Generation...")
+
+        period_df = pd.read_excel(PERIOD_FILE_PATH, header=None)
+        period_val = str(period_df.iloc[0, 0]).strip()
+
+        raw_df = pd.read_csv(RAW_DATA_FILE, usecols=['settled_at'], encoding='latin1', nrows=1)
+        raw_date = pd.to_datetime(raw_df['settled_at'].iloc[0]).strftime('%d.%m.%Y')
+
+        pay_df = pd.read_excel(INPUT_PAYMENT_SHEET)
+
+        sap_entries = []
+        mapping = [
+            ('91000467', 'net pg_payable', 'Escrow'),
+            ('91000463', 'net_cod_payable', 'Cod')
+        ]
+
+        for gl_code, col, txt_prefix in mapping:
+            for _, row in pay_df.iterrows():
+                val = pd.to_numeric(row[col], errors='coerce')
+                if pd.notnull(val) and val > 0:
+                    sap_entries.append({
+                        'Customer': row['SAP'],
+                        'Document_Date': raw_date,
+                        'Posting_Date': raw_date,
+                        'Company_Code': 'MKPL',
+                        'Currency_Rate': 'INR',
+                        'Reference': period_val,
+                        'Doc_Header_Text': period_val,
+                        'Assignment': 'MP payout',
+                        'GL': gl_code,
+                        'GST': '',
+                        'Amount_GL': -abs(round(float(val), 2)),
+                        'Amount_GST': '',
+                        'Amount_Customer': abs(round(float(val), 2)),
+                        'Profit_Center': '',
+                        'Cost_Center': 'FINANCE',
+                        'Text': f"MP payout {txt_prefix} {period_val}"
+                    })
+
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active
+
+        for i, entry in enumerate(sap_entries):
+            r = 2 + i
+            values = list(entry.values())
+            for c, val in enumerate(values, 1):
+                ws.cell(row=r, column=c).value = val
+
+        wb.save(SAP_OUTPUT_FILE)
+        print(f"✅ SAP File saved: {SAP_OUTPUT_FILE}")
+
+        generate_google_payment_uploader(pay_df, period_val, raw_date)
+        generate_jv_uploader()
+
+        send_gmail([SAP_OUTPUT_FILE, GOOGLE_UPLOADER_FILE, JV_OUTPUT_FILE])
+
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
+
+
+# ---------------- GOOGLE PAYMENT FILE CREATOR ---------------- #
+def generate_google_payment_uploader(pay_df, period_val, raw_date):
+    try:
+        print("Generating Google Payment Uploader...")
+
+        google_sap_list = ["8302253", "8302697"]
+        df_google = pay_df[pay_df["SAP"].astype(str).isin(google_sap_list)].copy()
+
+        df_google["GMV"] = pd.to_numeric(df_google["GMV"], errors="coerce").fillna(0)
+
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active
+
+        row_no = 2
+        for _, row in df_google.iterrows():
+            merchant_pay = round(float(row["GMV"]), 2)
+
+            ws.cell(row=row_no, column=1).value = row["SAP"]
+            ws.cell(row=row_no, column=2).value = raw_date
+            ws.cell(row=row_no, column=3).value = raw_date
+            ws.cell(row=row_no, column=4).value = "MKPL"
+            ws.cell(row=row_no, column=5).value = "INR"
+            ws.cell(row=row_no, column=6).value = period_val
+            ws.cell(row=row_no, column=7).value = period_val
+            ws.cell(row=row_no, column=8).value = "MP payout"
+            ws.cell(row=row_no, column=9).value = "91000467"
+            ws.cell(row=row_no, column=10).value = ""
+            ws.cell(row=row_no, column=11).value = -merchant_pay
+            ws.cell(row=row_no, column=12).value = ""
+            ws.cell(row=row_no, column=13).value = merchant_pay
+            ws.cell(row=row_no, column=14).value = ""
+            ws.cell(row=row_no, column=15).value = "FINANCE"
+            ws.cell(row=row_no, column=16).value = f"MP payout Escrow {period_val}"
+
+            row_no += 1
+
+        wb.save(GOOGLE_UPLOADER_FILE)
+        print(f"✅ Google Payment Uploader saved: {GOOGLE_UPLOADER_FILE}")
+
+    except Exception as e:
+        print(f"❌ Error in Google Payment Uploader: {e}")
+
+
+# ---------------- JV UPLOADER (FINAL VERSION INCLUDING SAP_UPLOADER FORMAT) ---------------- #
+def generate_jv_uploader():
+    try:
+        print("Generating JV Uploader...")
+
+        df_output = pd.read_excel(JV_SOURCE_FILE)
+        mm_df = pd.read_csv(MM_FILE, encoding='latin1')
+
+        df_output["GMV"] = pd.to_numeric(df_output["GMV"], errors='coerce').fillna(0)
+
+        df_pivot = df_output.groupby(["MID_WID", "Status"])["GMV"].sum().reset_index()
+
+        df_payout = df_pivot[df_pivot["Status"] == "Payout"].rename(columns={"GMV": "Payout"})
+        df_return = df_pivot[df_pivot["Status"] == "Return"].rename(columns={"GMV": "Return"})
+
+        df_merged = pd.merge(df_payout[["MID_WID", "Payout"]],
+                             df_return[["MID_WID", "Return"]],
+                             on="MID_WID",
+                             how="outer")
+
+        df_merged["Payout"] = df_merged["Payout"].fillna(0)
+        df_merged["Return"] = df_merged["Return"].fillna(0)
+        df_merged["Total"] = df_merged["Payout"] + df_merged["Return"]
+
+        mm_df["MID_WID"] = mm_df["MID_WID"].astype(str)
+        df_merged["MID_WID"] = df_merged["MID_WID"].astype(str)
+
+        df_merged = pd.merge(df_merged,
+                             mm_df[["MID_WID", "SAP_New_Code"]],
+                             on="MID_WID",
+                             how="left")
+
+        df_merged.rename(columns={"SAP_New_Code": "SAP"}, inplace=True)
+
+        # ------------ LOAD JV FORMAT FILE ------------
+        wb = load_workbook(JV_FORMAT_FILE)
+
+        # ------------ RENAME sheet "Sheet1" → "SAP_Uploader" ------------
+        ws_template = wb["Sheet1"]
+        ws_template.title = "SAP_Uploader"
+
+        # ------------ CREATE Gross SHEET ------------
+        if "Gross" in wb.sheetnames:
+            del wb["Gross"]
+        ws_gross = wb.create_sheet("Gross")
+
+        headers = ["MID_WID", "Payout", "Return", "Total", "SAP"]
+        for col_idx, col_name in enumerate(headers, 1):
+            ws_gross.cell(row=1, column=col_idx).value = col_name
+
+        for idx, row in df_merged.iterrows():
+            ws_gross.cell(row=idx + 2, column=1).value = row["MID_WID"]
+            ws_gross.cell(row=idx + 2, column=2).value = row["Payout"]
+            ws_gross.cell(row=idx + 2, column=3).value = row["Return"]
+            ws_gross.cell(row=idx + 2, column=4).value = row["Total"]
+            ws_gross.cell(row=idx + 2, column=5).value = row["SAP"]
+
+        # ------------ BUILD SAP_UPLOADER SHEET EXACTLY AS REQUIRED ------------ #
+        ws = wb["SAP_Uploader"]
+
+        # Load Document_Date & Reference from sap_payment_uploader.xlsx
+        sap_df = pd.read_excel(SAP_OUTPUT_FILE)
+        sap_doc_date = sap_df["Document_Date"].iloc[0]
+        sap_ref = sap_df["Reference"].iloc[0]
+
+        # Required Headers in SAP_Uploader (fixed)
+        uploader_headers = [
+            "SerialNo","DocumentDate","DocumentType","CompanyCode",
+            "Posting_Date","Currency","Reference","HeaderText","PostingKey",
+            "Account_No","SpecialGLindicator","TransactionType","Amount","TaxCode",
+            "BusinessPlace","SectionCode","PaymentTerm","BaselineDate",
+            "PaymentReference","A","B","Assignment","CostCenter","ProfitCenter","C",
+            "InternalOrder","Text"
+        ]
+
+        for col_idx, h in enumerate(uploader_headers, 1):
+            ws.cell(row=1, column=col_idx).value = h
+
+        # Fill rows using Gross sheet data
+        for idx, row in df_merged.iterrows():
+            excel_row = idx + 2
+
+            ws.cell(row=excel_row, column=1).value = idx + 1
+            ws.cell(row=excel_row, column=2).value = sap_doc_date
+            ws.cell(row=excel_row, column=3).value = "SA"
+            ws.cell(row=excel_row, column=4).value = "MKPL"
+            ws.cell(row=excel_row, column=5).value = sap_doc_date
+            ws.cell(row=excel_row, column=6).value = "INR"
+            ws.cell(row=excel_row, column=7).value = sap_ref
+            ws.cell(row=excel_row, column=8).value = sap_ref
+            ws.cell(row=excel_row, column=9).value = "40"
+            ws.cell(row=excel_row, column=10).value = row["SAP"]
+            ws.cell(row=excel_row, column=11).value = ""
+            ws.cell(row=excel_row, column=12).value = ""
+            ws.cell(row=excel_row, column=13).value = row["Payout"]
+            ws.cell(row=excel_row, column=14).value = "v0"
+            ws.cell(row=excel_row, column=15).value = "1000"
+            ws.cell(row=excel_row, column=16).value = "1000"
+            ws.cell(row=excel_row, column=17).value = "0001"
+            ws.cell(row=excel_row, column=18).value = sap_doc_date
+            ws.cell(row=excel_row, column=19).value = ""
+            ws.cell(row=excel_row, column=20).value = "Gross"
+            ws.cell(row=excel_row, column=21).value = "FINANCE"
+            ws.cell(row=excel_row, column=22).value = ""
+            ws.cell(row=excel_row, column=23).value = ""
+            ws.cell(row=excel_row, column=24).value = f"MP Payt Gross {sap_ref}"
+
+        wb.save(JV_OUTPUT_FILE)
+        print(f"✅ JV Uploader created EXACTLY as required → {JV_OUTPUT_FILE}")
+
+    except Exception as e:
+        print(f"❌ JV Uploader Error: {e}")
+
+
+# ---------------- RUN ---------------- #
+if __name__ == "__main__":
+    generate_sap_upload()

@@ -1,0 +1,267 @@
+import pandas as pd
+import numpy as np
+import os
+import smtplib
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+from openpyxl import load_workbook, Workbook
+
+# --- CONFIGURATION (Paths) ---
+BASE_DIR = r'D:\3) Monthly Task\Payout Calculation\Finance_Automation'
+
+# Input Files
+HEADER_FILE = os.path.join(BASE_DIR, 'input_files', 'Header.xlsx')
+DATA_FILE = os.path.join(BASE_DIR, 'input_files', 'compact_revenue_report.csv')
+MM_FILE = os.path.join(BASE_DIR, 'input_files', 'MM.csv')
+PERIOD_FILE_PATH = os.path.join(BASE_DIR, 'input_files', 'Period.xlsx')
+INPUT_PAYMENT_SHEET = os.path.join(BASE_DIR, 'output_files', 'payment sheet.xlsx')
+
+# Template Files
+SAP_TEMPLATE_PATH = os.path.join(BASE_DIR, 'Uploader format', 'Payment_format.xlsx')
+JV_FORMAT_FILE = os.path.join(BASE_DIR, 'Uploader format', 'JV_Uploader_format.xlsx')
+
+# Output Files
+OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'output.xlsx')
+JV_WORKING_FILE = os.path.join(BASE_DIR, 'output_files', 'jv_working.xlsx')
+SAP_OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'sap_payment_uploader.xlsx')
+GOOGLE_UPLOADER_FILE = os.path.join(BASE_DIR, 'output_files', 'Google_Payment_Uploader.xlsx')
+
+# JV Specific Outputs
+JV_GROSS_OUTPUT = os.path.join(BASE_DIR, 'output_files', 'jv_uploader_gross.xlsx')
+JV_RETURN_OUTPUT = os.path.join(BASE_DIR, 'output_files', 'jv_uploader_return.xlsx')
+JV_COMM_OUTPUT = os.path.join(BASE_DIR, 'output_files', 'jv_uploader_commission.xlsx')
+FINAL_MERGED_JV = os.path.join(BASE_DIR, 'output_files', 'jv_uploader.xlsx')
+
+# Email Credentials
+SENDER_EMAIL = "harsh.rawat@paipai.mobi"
+SENDER_PASSWORD = "ryklyfoiqfkqyevv"
+RECEIVER_EMAIL = ["harsh.rawat@paipai.mobi"]
+
+# ---------------- 1. REVENUE & WORKING FILE PROCESSING ---------------- #
+
+def process_revenue_report():
+    try:
+        print("Processing Revenue Report...")
+        header_df = pd.read_excel(HEADER_FILE)
+        template_headers = header_df.columns.tolist()
+        df = pd.read_csv(DATA_FILE, encoding='latin1', low_memory=False)
+        
+        # Filter Exclusions
+        df = df[~df['merchant_id'].isin([1530540, 1530543, 1530541, 870346])]
+
+        def to_num(cols, target_df=df):
+            for col in cols:
+                if col not in target_df.columns: target_df[col] = 0.0
+                target_df[col] = pd.to_numeric(target_df[col], errors='coerce').fillna(0)
+
+        df['MID_WID'] = np.where((df['finance_key_type'].fillna('') == 'default') | (df['finance_key_type'].isna()), 
+                                 df['merchant_id'].astype(str), 
+                                 df['merchant_id'].astype(str) + "_" + df['warehouse_id'].fillna('').astype(str))
+        
+        to_num(['price', 'qty_ordered', 'direction'])
+        base_gmv = (df['price'] * df['qty_ordered']).round(2)
+        df['GMV'] = np.where(df['direction'] == 1, base_gmv, np.where(df['direction'] == 2, -base_gmv, 0))
+
+        comm_cols = ['pg_commission', 'mp_commission', 'logistics_penalty', 'reverse_logistics_penalty', 
+                     'merchant_cancel_mp_penalty', 'logistics', 'marketing_fee', 'closing_fee', 
+                     'deal_setup_fees', 'pf_taxes_comm', 'pf_pac_comm', 'pf_scf_comm']
+        to_num(comm_cols + ['cust_shipping_reversal', 'pf_tax', 'pf_packing', 'pf_seller_convenience', 
+                            'product_igst', 'product_cgst', 'product_sgst', 'tds_ecom', 'cart_conv_fee'])
+        
+        df['Commission'] = df[comm_cols].sum(axis=1).round(2)
+        df['Tax'] = (df['Commission'] * 0.18).round(2)
+        
+        final_export_cols = list(dict.fromkeys(template_headers + ['MID_WID', 'direction', 'GMV', 'Commission', 'Tax']))
+        df[[c for c in final_export_cols if c in df.columns]].to_excel(OUTPUT_FILE, index=False)
+        
+        generate_jv_working(df)
+    except Exception as e:
+        print(f"❌ Revenue Process error: {e}")
+
+def generate_jv_working(df):
+    try:
+        mm_df = pd.read_csv(MM_FILE, encoding='latin1')
+        mm_df['MID_WID'] = mm_df['MID_WID'].astype(str).str.strip()
+        mm_df = mm_df.drop_duplicates(subset=["MID_WID"])
+
+        jv_pivot = pd.pivot_table(df, values='GMV', index='MID_WID', columns='direction', aggfunc='sum').reset_index()
+        jv_pivot = jv_pivot.rename(columns={1: 'direction_1', 2: 'direction_2'}).fillna(0)
+
+        extra_agg = df.groupby('MID_WID')[['Commission', 'Tax']].sum().reset_index()
+        final_jv = pd.merge(jv_pivot, mm_df[['MID_WID', 'SAP_New_Code']], on='MID_WID', how='left')
+        final_jv = pd.merge(final_jv, extra_agg, on='MID_WID', how='left').rename(columns={'SAP_New_Code': 'SAP'})
+
+        final_jv.to_excel(JV_WORKING_FILE, index=False)
+        print("✅ jv_working.xlsx generated.")
+    except Exception as e:
+        print(f"❌ JV Working Error: {e}")
+
+# ---------------- 2. SAP & GOOGLE UPLOADER GENERATION ---------------- #
+
+def generate_sap_and_google_uploads(period_val, raw_date):
+    try:
+        print("Generating SAP and Google Uploaders...")
+        pay_df = pd.read_excel(INPUT_PAYMENT_SHEET)
+        sap_entries = []
+        mapping = [('91000467', 'net pg_payable', 'Escrow'), ('91000463', 'net_cod_payable', 'Cod')]
+
+        for gl_code, col, txt_prefix in mapping:
+            for _, row in pay_df.iterrows():
+                val = pd.to_numeric(row[col], errors='coerce')
+                if pd.notnull(val) and val > 0:
+                    sap_entries.append({
+                        'Customer': row['SAP'], 'Document_Date': raw_date, 'Posting_Date': raw_date,
+                        'Company_Code': 'MKPL', 'Currency_Rate': 'INR', 'Reference': period_val,
+                        'Doc_Header_Text': period_val, 'Assignment': 'MP payout', 'GL': gl_code,
+                        'GST': '', 'Amount_GL': -abs(round(float(val), 2)), 'Amount_GST': '',
+                        'Amount_Customer': abs(round(float(val), 2)), 'Profit_Center': '',
+                        'Cost_Center': 'FINANCE', 'Text': f"MP payout {txt_prefix} {period_val}"
+                    })
+
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active
+        for i, entry in enumerate(sap_entries):
+            for c, val in enumerate(list(entry.values()), 1):
+                ws.cell(row=2 + i, column=c).value = val
+        wb.save(SAP_OUTPUT_FILE)
+        
+        # Google Specific
+        google_sap_list = ["8302253", "8302697"]
+        df_google = pay_df[pay_df["SAP"].astype(str).isin(google_sap_list)].copy()
+        wb_g = load_workbook(SAP_TEMPLATE_PATH)
+        ws_g = wb_g.active
+        for i, (_, row) in enumerate(df_google.iterrows()):
+            amt = round(float(pd.to_numeric(row["GMV"], errors="coerce") or 0), 2)
+            data = [row["SAP"], raw_date, raw_date, "MKPL", "INR", period_val, period_val, "MP payout", "91000467", "", -amt, "", amt, "", "FINANCE", f"MP payout Escrow {period_val}"]
+            for c, v in enumerate(data, 1): ws_g.cell(row=2 + i, column=c).value = v
+        wb_g.save(GOOGLE_UPLOADER_FILE)
+        print("✅ SAP and Google uploaders generated.")
+    except Exception as e:
+        print(f"❌ SAP/Google Error: {e}")
+
+# ---------------- 3. JV UPLOADER GENERATION (GROSS, RETURN, COMM) ---------------- #
+
+def generate_jv_uploaders(period_val, raw_date):
+    try:
+        jv_working = pd.read_excel(JV_WORKING_FILE)
+        configs = [
+            {'output': JV_GROSS_OUTPUT, 'keep': 'sales gross', 'rem': 'sales return', 'col': 'direction_1', 'ser': 1, 'pk_m': '40', 'pk_s': '11', 'acc': '13025016', 'txt': 'MP Payt Gross', 'm': 1},
+            {'output': JV_RETURN_OUTPUT, 'keep': 'sales return', 'rem': 'sales gross', 'col': 'direction_2', 'ser': 2, 'pk_m': '50', 'pk_s': '01', 'acc': '13025014', 'txt': 'MP Refunded Gross', 'm': -1}
+        ]
+        for cfg in configs:
+            wb = load_workbook(JV_FORMAT_FILE)
+            if cfg['rem'] in wb.sheetnames: del wb[cfg['rem']]
+            ws = wb[cfg['keep']]
+            total = round(jv_working[cfg['col']].sum() * cfg['m'], 2)
+            ws.cell(row=2, column=1).value = cfg['ser']
+            ws.cell(row=2, column=9).value = cfg['pk_m']
+            ws.cell(row=2, column=10).value = cfg['acc']
+            ws.cell(row=2, column=13).value = total
+            
+            curr = 3
+            for _, row in jv_working.iterrows():
+                val = round(float(row[cfg['col']]) * cfg['m'], 2)
+                if val == 0: continue
+                ws.cell(row=curr, column=1).value = cfg['ser']
+                ws.cell(row=curr, column=9).value = cfg['pk_s']
+                ws.cell(row=curr, column=10).value = row["SAP"]
+                ws.cell(row=curr, column=13).value = val
+                for r in [2, curr]:
+                    ws.cell(row=r, column=2).value = ws.cell(row=r, column=5).value = raw_date
+                    ws.cell(row=r, column=7).value = ws.cell(row=r, column=8).value = period_val
+                    ws.cell(row=r, column=27).value = f"{cfg['txt']} {period_val}"
+                curr += 1
+            wb.save(cfg['output'])
+        
+        generate_commission_uploader(jv_working, period_val, raw_date)
+    except Exception as e:
+        print(f"❌ JV Generation Error: {e}")
+
+def generate_commission_uploader(jv_working, period_val, raw_date):
+    try:
+        wb = load_workbook(JV_FORMAT_FILE)
+        for s in ['sales gross', 'sales return']:
+            if s in wb.sheetnames: del wb[s]
+        ws = wb['Commission']
+        total_comm_tax = round((jv_working['Commission'] + jv_working['Tax']).sum(), 2)
+        h1_amt, h2_amt = round(total_comm_tax / 1.18, 2), round(total_comm_tax - (total_comm_tax / 1.18), 2)
+        
+        ws.cell(row=2, column=13).value, ws.cell(row=3, column=13).value = h1_amt, h2_amt
+        curr = 4
+        for _, row in jv_working.iterrows():
+            amt = round(row['Commission'] + row['Tax'], 2)
+            if amt == 0: continue
+            ws.cell(row=curr, column=10).value, ws.cell(row=curr, column=13).value = row["SAP"], amt
+            curr += 1
+        for r in range(2, curr):
+            ws.cell(row=r, column=1).value = 3
+            ws.cell(row=r, column=2).value = ws.cell(row=r, column=5).value = raw_date
+            ws.cell(row=r, column=7).value = ws.cell(row=r, column=8).value = period_val
+            ws.cell(row=r, column=27).value = f"MP Payt Commission {period_val}"
+        wb.save(JV_COMM_OUTPUT)
+        print("✅ Commission Uploader generated.")
+    except Exception as e: print(f"❌ Commission Error: {e}")
+
+# ---------------- 4. MERGE & EMAIL ---------------- #
+
+def merge_all_jv_files():
+    try:
+        print("Merging all JVs into one worksheet...")
+        df_gross = pd.read_excel(JV_GROSS_OUTPUT)
+        df_return = pd.read_excel(JV_RETURN_OUTPUT)
+        df_comm = pd.read_excel(JV_COMM_OUTPUT)
+        
+        combined = pd.concat([df_gross, df_return, df_comm], ignore_index=True)
+        combined.to_excel(FINAL_MERGED_JV, index=False, sheet_name='Uploader')
+        print(f"✅ Final merged file: {FINAL_MERGED_JV}")
+    except Exception as e: print(f"❌ Merging Error: {e}")
+
+def send_gmail(attachments):
+    try:
+        current_date = datetime.now().strftime('%d-%m-%Y')
+        msg = MIMEMultipart()
+        msg['Subject'] = f"SAP + Google + JV Payment uploader dated {current_date}"
+        msg['From'], msg['To'] = SENDER_EMAIL, ", ".join(RECEIVER_EMAIL)
+        msg.attach(MIMEText(f"Attached are the uploaders for {current_date}.", 'plain'))
+
+        for path in attachments:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f"attachment; filename={os.path.basename(path)}")
+                    msg.attach(part)
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+        server.quit()
+        print("📧 Email sent successfully.")
+    except Exception as e: print(f"❌ Email error: {e}")
+
+# ---------------- MAIN EXECUTION ---------------- #
+
+if __name__ == "__main__":
+    # 1. Process Raw Data
+    process_revenue_report()
+    
+    # 2. Get Period and Date for Uploaders
+    period_df = pd.read_excel(PERIOD_FILE_PATH, header=None)
+    period_val = str(period_df.iloc[0, 0]).strip()
+    raw_df = pd.read_csv(DATA_FILE, usecols=['settled_at'], encoding='latin1', nrows=1)
+    raw_date = pd.to_datetime(raw_df['settled_at'].iloc[0]).strftime('%d.%m.%Y')
+    
+    # 3. Generate Uploaders
+    generate_sap_and_google_uploads(period_val, raw_date)
+    generate_jv_uploaders(period_val, raw_date)
+    
+    # 4. Merge JVs
+    merge_all_jv_files()
+    
+    # 5. Email Final Files
+    send_gmail([SAP_OUTPUT_FILE, GOOGLE_UPLOADER_FILE, FINAL_MERGED_JV])

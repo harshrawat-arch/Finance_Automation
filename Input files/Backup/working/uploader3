@@ -1,0 +1,167 @@
+import pandas as pd
+import os
+import smtplib
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+from openpyxl import load_workbook
+
+# --- CONFIGURATION ---
+BASE_DIR = r'D:\3) Monthly Task\Payout Calculation\Finance_Automation'
+
+INPUT_PAYMENT_SHEET = os.path.join(BASE_DIR, 'output_files', 'payment sheet.xlsx')
+RAW_DATA_FILE = os.path.join(BASE_DIR, 'input_files', 'compact_revenue_report.csv')
+PERIOD_FILE_PATH = os.path.join(BASE_DIR, 'input_files', 'Period.xlsx')
+
+SAP_TEMPLATE_PATH = os.path.join(BASE_DIR, 'Uploader format', 'Payment_format.xlsx')
+SAP_OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'sap_payment_uploader.xlsx')
+GOOGLE_UPLOADER_FILE = os.path.join(BASE_DIR, 'output_files', 'Google_Payment_Uploader.xlsx')
+
+# Email Credentials
+SENDER_EMAIL = "harsh.rawat@paipai.mobi"
+SENDER_PASSWORD = "ryklyfoiqfkqyevv"
+RECEIVER_EMAIL = ["harsh.rawat@paipai.mobi", "gaurav43.kumar@paipai.mobi"]
+
+# ---------------- EMAIL SENDER ---------------- #
+def send_gmail(attachments):
+    try:
+        current_date = datetime.now().strftime('%d-%m-%Y')
+        subject = f"SAP + Google Payment uploader dated {current_date}"
+        body = f"Please find the attached SAP & Google Payment Uploader files for {current_date}."
+
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ", ".join(RECEIVER_EMAIL)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        for attachment_path in attachments:
+            if os.path.exists(attachment_path):
+                filename = os.path.basename(attachment_path)
+                with open(attachment_path, "rb") as attachment:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f"attachment; filename={filename}")
+                    msg.attach(part)
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+        server.quit()
+
+        print("📧 Email sent successfully with SAP + Google Uploader")
+
+    except Exception as e:
+        print(f"❌ Email sending error: {e}")
+
+# ---------------- SAP FILE CREATOR ---------------- #
+def generate_sap_upload():
+    try:
+        print("Starting SAP Uploader Generation...")
+
+        period_df = pd.read_excel(PERIOD_FILE_PATH, header=None)
+        period_val = str(period_df.iloc[0, 0]).strip()
+
+        raw_df = pd.read_csv(RAW_DATA_FILE, usecols=['settled_at'], encoding='latin1', nrows=1)
+        raw_date = pd.to_datetime(raw_df['settled_at'].iloc[0]).strftime('%d.%m.%Y')
+
+        pay_df = pd.read_excel(INPUT_PAYMENT_SHEET)
+
+        sap_entries = []
+        mapping = [
+            ('91000467', 'net pg_payable', 'Escrow'),   # UPDATED FROM Nodal → Escrow
+            ('91000463', 'net_cod_payable', 'Cod')
+        ]
+
+        for gl_code, col, txt_prefix in mapping:
+            for _, row in pay_df.iterrows():
+                val = pd.to_numeric(row[col], errors='coerce')
+                if pd.notnull(val) and val > 0:
+                    sap_entries.append({
+                        'Customer': row['SAP'],
+                        'Document_Date': raw_date,
+                        'Posting_Date': raw_date,
+                        'Company_Code': 'MKPL',
+                        'Currency_Rate': 'INR',
+                        'Reference': period_val,
+                        'Doc_Header_Text': period_val,
+                        'Assignment': 'MP payout',
+                        'GL': gl_code,
+                        'GST': '',
+                        'Amount_GL': -abs(round(float(val), 2)),
+                        'Amount_GST': '',
+                        'Amount_Customer': abs(round(float(val), 2)),
+                        'Profit_Center': '',
+                        'Cost_Center': 'FINANCE',
+                        'Text': f"MP payout {txt_prefix} {period_val}"  # UPDATED
+                    })
+
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active
+
+        for i, entry in enumerate(sap_entries):
+            r = 2 + i
+            values = list(entry.values())
+            for c, val in enumerate(values, 1):
+                ws.cell(row=r, column=c).value = val
+
+        wb.save(SAP_OUTPUT_FILE)
+        print(f"✅ SAP File saved: {SAP_OUTPUT_FILE}")
+
+        generate_google_payment_uploader(pay_df, period_val, raw_date)
+
+        send_gmail([SAP_OUTPUT_FILE, GOOGLE_UPLOADER_FILE])
+
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
+
+# ---------------- GOOGLE PAYMENT FILE CREATOR ---------------- #
+def generate_google_payment_uploader(pay_df, period_val, raw_date):
+    try:
+        print("Generating Google Payment Uploader...")
+
+        google_sap_list = ["8302253", "8302697"]
+
+        df_google = pay_df[pay_df["SAP"].astype(str).isin(google_sap_list)].copy()
+
+        df_google["merchant_payable2"] = pd.to_numeric(df_google["merchant_payable2"], errors="coerce").fillna(0)
+
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active
+
+        row_no = 2
+        for _, row in df_google.iterrows():
+            merchant_pay = round(float(row["merchant_payable2"]), 2)
+
+            ws.cell(row=row_no, column=1).value = row["SAP"]
+            ws.cell(row=row_no, column=2).value = raw_date
+            ws.cell(row=row_no, column=3).value = raw_date
+            ws.cell(row=row_no, column=4).value = "MKPL"
+            ws.cell(row=row_no, column=5).value = "INR"
+            ws.cell(row=row_no, column=6).value = period_val
+            ws.cell(row=row_no, column=7).value = period_val
+            ws.cell(row=row_no, column=8).value = "MP payout"                 # UPDATED
+            ws.cell(row=row_no, column=9).value = "91000467"
+            ws.cell(row=row_no, column=10).value = ""
+            ws.cell(row=row_no, column=11).value = -merchant_pay
+            ws.cell(row=row_no, column=12).value = ""
+            ws.cell(row=row_no, column=13).value = merchant_pay
+            ws.cell(row=row_no, column=14).value = ""
+            ws.cell(row=row_no, column=15).value = "FINANCE"
+            ws.cell(row=row_no, column=16).value = f"MP payout Escrow {period_val}"  # UPDATED
+
+            row_no += 1
+
+        wb.save(GOOGLE_UPLOADER_FILE)
+        print(f"✅ Google Payment Uploader saved: {GOOGLE_UPLOADER_FILE}")
+
+    except Exception as e:
+        print(f"❌ Error in Google Payment Uploader: {e}")
+
+# ---------------- RUN ---------------- #
+if __name__ == "__main__":
+    generate_sap_upload()

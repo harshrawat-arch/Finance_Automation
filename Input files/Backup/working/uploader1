@@ -1,0 +1,127 @@
+import pandas as pd
+import os
+from openpyxl import load_workbook
+
+# --- CONFIGURATION ---
+BASE_DIR = r'D:\3) Monthly Task\Payout Calculation\Finance_Automation'
+
+# File paths
+INPUT_PAYMENT_SHEET = os.path.join(BASE_DIR, 'output_files', 'payment sheet.xlsx')
+RAW_DATA_FILE = os.path.join(BASE_DIR, 'input_files', 'compact_revenue_report.csv')
+PERIOD_FILE_PATH = os.path.join(BASE_DIR, 'input_files', 'Period.xlsx')
+
+SAP_TEMPLATE_PATH = os.path.join(BASE_DIR, 'Uploader format', 'Payment_format.xlsx')
+SAP_OUTPUT_FILE = os.path.join(BASE_DIR, 'output_files', 'SAP_Final_Upload.xlsx')
+
+def generate_sap_upload():
+    try:
+        print("Starting SAP Uploader Generation...")
+
+        # 1. Verify File Existence
+        if not os.path.exists(SAP_TEMPLATE_PATH):
+            print(f"❌ Error: Template file not found at {SAP_TEMPLATE_PATH}")
+            return
+        if not os.path.exists(PERIOD_FILE_PATH):
+            print(f"❌ Error: Period.xlsx not found at {PERIOD_FILE_PATH}")
+            return
+
+        # 2. Get Period String from Period.xlsx (from input_files)
+        period_df = pd.read_excel(PERIOD_FILE_PATH, header=None)
+        period_val = str(period_df.iloc[0, 0]).strip()
+        print(f"Period identified from file: {period_val}")
+
+        # 3. Get Date from Raw Data (settled_at)
+        raw_df = pd.read_csv(RAW_DATA_FILE, usecols=['settled_at'], encoding='latin1', nrows=1, low_memory=False)
+        raw_date = pd.to_datetime(raw_df['settled_at'].iloc[0]).strftime('%d.%m.%Y')
+
+        # 4. Load Processed Payment Data
+        pay_df = pd.read_excel(INPUT_PAYMENT_SHEET)
+        sap_entries = []
+
+        # --- STEP A: Process PG Payable FIRST (GL: 91000467) ---
+        # Logic: Strictly excludes zero and NaN values
+        for _, row in pay_df.iterrows():
+            val_pg = pd.to_numeric(row['net pg_payable'], errors='coerce')
+            if pd.notnull(val_pg) and val_pg > 0:
+                val = round(float(val_pg), 2)
+                sap_entries.append({
+                    'Customer': row['SAP'],
+                    'Document_Date': raw_date,
+                    'Posting_Date': raw_date,
+                    'Company_Code': 'MKPL',
+                    'Currency_Rate': 'INR',
+                    'Reference': period_val,
+                    'Doc_Header_Text': period_val,
+                    'Assignment': 'MP payout',
+                    'GL': '91000467',
+                    'GST': '',
+                    'Amount_GL': -abs(val),       # Always Negative
+                    'Amount_GST': '',
+                    'Amount_Customer': abs(val),   # Always Positive
+                    'Profit_Center': '',
+                    'Cost_Center': 'FINANCE',
+                    'Text': f"MP payout Nodal {period_val}"
+                })
+        
+        # --- STEP B: Process COD Payable SECOND (GL: 91000463) ---
+        for _, row in pay_df.iterrows():
+            val_cod = pd.to_numeric(row['net_cod_payable'], errors='coerce')
+            if pd.notnull(val_cod) and val_cod > 0:
+                val = round(float(val_cod), 2)
+                sap_entries.append({
+                    'Customer': row['SAP'],
+                    'Document_Date': raw_date,
+                    'Posting_Date': raw_date,
+                    'Company_Code': 'MKPL',
+                    'Currency_Rate': 'INR',
+                    'Reference': period_val,
+                    'Doc_Header_Text': period_val,
+                    'Assignment': 'MP payout',
+                    'GL': '91000463',
+                    'GST': '',
+                    'Amount_GL': -abs(val),       # Always Negative
+                    'Amount_GST': '',
+                    'Amount_Customer': abs(val),   # Always Positive
+                    'Profit_Center': '',
+                    'Cost_Center': 'FINANCE',
+                    'Text': f"MP payout Cod {period_val}" # Updated with "Cod"
+                })
+
+        if not sap_entries:
+            print("⚠️ No data found with payables > 0. SAP file not generated.")
+            return
+
+        # 5. Write to Excel Template using openpyxl
+        wb = load_workbook(SAP_TEMPLATE_PATH)
+        ws = wb.active 
+
+        # Map data to columns 1 through 16 exactly
+        for i, entry in enumerate(sap_entries):
+            r = 2 + i
+            ws.cell(row=r, column=1).value = entry['Customer']
+            ws.cell(row=r, column=2).value = entry['Document_Date']
+            ws.cell(row=r, column=3).value = entry['Posting_Date']
+            ws.cell(row=r, column=4).value = entry['Company_Code']
+            ws.cell(row=r, column=5).value = entry['Currency_Rate']
+            ws.cell(row=r, column=6).value = entry['Reference']
+            ws.cell(row=r, column=7).value = entry['Doc_Header_Text']
+            ws.cell(row=r, column=8).value = entry['Assignment']
+            ws.cell(row=r, column=9).value = entry['GL']
+            ws.cell(row=r, column=10).value = entry['GST']
+            ws.cell(row=r, column=11).value = entry['Amount_GL']
+            ws.cell(row=r, column=12).value = entry['Amount_GST']
+            ws.cell(row=r, column=13).value = entry['Amount_Customer']
+            ws.cell(row=r, column=14).value = entry['Profit_Center']
+            ws.cell(row=r, column=15).value = entry['Cost_Center']
+            ws.cell(row=r, column=16).value = entry['Text']
+
+        # 6. Final Save
+        wb.save(SAP_OUTPUT_FILE)
+        print(f"✅ SUCCESS: SAP Uploader generated with {len(sap_entries)} rows.")
+        print(f"Location: {SAP_OUTPUT_FILE}")
+
+    except Exception as e:
+        print(f"❌ Critical Error: {e}")
+
+if __name__ == "__main__":
+    generate_sap_upload()

@@ -3,6 +3,7 @@ import numpy as np
 import os
 from checkList import create_checklist_pivot
 from sendmail import send_gmail
+from uploader import main_function
 
 # --- CONFIGURATION (Input/Output Paths) ---
 HEADER_FILE = r'input_files\Header.xlsx'
@@ -15,6 +16,7 @@ OUTPUT_FILE = r'output_files\output.xlsx'
 SUMMARY_FILE = r'output_files\payout_summary.xlsx'
 PAYMENT_SHEET_FILE = r'output_files\payment sheet.xlsx'
 CHECKLIST_FILE = r'output_files\checklist.xlsx'
+JV_WORKING_FILE = r'output_files\jv_working.xlsx'
 
 
 def process_revenue_report():
@@ -166,7 +168,6 @@ def process_revenue_report():
             rec_df = pd.read_csv(RECOVERY_FILE, encoding='latin1')
             rec_df['Merchant_ID'] = rec_df['Merchant_ID'].astype(str)
             to_num(['TOTAL'], target_df=rec_df)
-            rec_df['TOTAL'] = rec_df['TOTAL'].abs()
             rec_grouped = rec_df.groupby('Merchant_ID')['TOTAL'].sum().reset_index()
             payment_df['m_id_str'] = payment_df['merchant_id'].astype(str)
             payment_df = pd.merge(payment_df, rec_grouped, left_on='m_id_str', right_on='Merchant_ID', how='left')
@@ -210,15 +211,7 @@ def process_revenue_report():
 
         payment_df[pay_headers].fillna("").to_excel(PAYMENT_SHEET_FILE, index=False)
 
-        # --- UPDATE SUMMARY TABLE LOGIC (Adjust_Recovery) ---
-        adj_escrow = payment_df['Recovered_pg'].sum()
-        adj_cod = payment_df['Recovered_cod'].sum()
-        adj_total = adj_escrow + adj_cod
-        
-        print(f"Summary Row 'Adjust_Recovery': ESCROW={adj_escrow}, COD={adj_cod}, TOTAL={adj_total}")
-
         # --- PREPARE FINAL OUTPUT COLUMNS ---
-        # Explicitly adding requested columns to the final export list
         requested_cols = [
             'pf', 'product_gst', 'TCS', 'TDS', 
             'shipping_amount2', 'additional_delivery_charges2', 'cart_conv_fee2'
@@ -230,7 +223,6 @@ def process_revenue_report():
             'pg_payable2', 'cod_payable2'
         ]
         
-        # Combine template headers with extra and requested columns while preserving uniqueness
         final_export_cols = []
         seen = set()
         
@@ -240,14 +232,66 @@ def process_revenue_report():
                 seen.add(col)
 
         df[final_export_cols].to_excel(OUTPUT_FILE, index=False)
+        print(f"✅ SUCCESS — All files generated.")
 
-        print(f"✅ SUCCESS — All files generated. Output contains {len(final_export_cols)} columns.")
+        # --- NEW SECTION: JV WORKING GENERATION ---
+        generate_jv_working()
 
     except Exception as e:
         print(f"❌ Error: {e}")
+
+def generate_jv_working():
+    try:
+        print("Generating jv_working.xlsx...")
+        # 1. Load the generated output file and MM for SAP
+        out_df = pd.read_excel(OUTPUT_FILE)
+        mm_df = pd.read_csv(MM_FILE, encoding='latin1')
+        mm_df.columns = mm_df.columns.str.strip()
+        mm_df['MID_WID'] = mm_df['MID_WID'].astype(str).str.strip()
+        mm_df = mm_df.drop_duplicates(subset=["MID_WID"], keep="first")
+
+        # 2. Pivot GMV by direction
+        # Convert GMV to absolute for direction 2 so that 'direction_2' shows a positive value or keep as is? 
+        # Requirement says "sum of GMV", we'll keep the signs from the output.xlsx logic.
+        jv_pivot = pd.pivot_table(
+            out_df, 
+            values='GMV', 
+            index='MID_WID', 
+            columns='direction', 
+            aggfunc='sum'
+        ).reset_index()
+
+        # Rename columns as requested
+        jv_pivot = jv_pivot.rename(columns={1: 'direction_1', 2: 'direction_2'})
+        
+        # Ensure columns exist even if one direction is missing in the data
+        if 'direction_1' not in jv_pivot.columns: jv_pivot['direction_1'] = 0
+        if 'direction_2' not in jv_pivot.columns: jv_pivot['direction_2'] = 0
+        
+        jv_pivot['direction_1'] = jv_pivot['direction_1'].fillna(0)
+        jv_pivot['direction_2'] = jv_pivot['direction_2'].fillna(0)
+
+        # 3. Add SAP column from MM.csv
+        jv_pivot['MID_WID_STR'] = jv_pivot['MID_WID'].astype(str)
+        jv_pivot = pd.merge(jv_pivot, mm_df[['MID_WID', 'SAP_New_Code']], left_on='MID_WID_STR', right_on='MID_WID', how='left')
+        jv_pivot.rename(columns={'SAP_New_Code': 'SAP'}, inplace=True)
+
+        # 4. Calculate Total
+        jv_pivot['Total'] = jv_pivot['direction_1'] + jv_pivot['direction_2']
+
+        # Select final 5 columns
+        final_jv = jv_pivot[['MID_WID_x', 'SAP', 'direction_1', 'direction_2', 'Total']]
+        final_jv = final_jv.rename(columns={'MID_WID_x': 'MID_WID'})
+
+        final_jv.to_excel(JV_WORKING_FILE, index=False)
+        print(f"✅ JV Working file saved: {JV_WORKING_FILE}")
+
+    except Exception as e:
+        print(f"❌ JV Working Error: {e}")
 
 
 if __name__ == "__main__":
     process_revenue_report()
     create_checklist_pivot(OUTPUT_FILE, CHECKLIST_FILE)
     send_gmail()
+    main_function()

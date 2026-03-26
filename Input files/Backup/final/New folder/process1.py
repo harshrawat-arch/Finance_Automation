@@ -1,0 +1,295 @@
+import pandas as pd
+import numpy as np
+import os
+from checkList import create_checklist_pivot
+from sendmail import send_gmail
+
+# --- CONFIGURATION (Input/Output Paths) ---
+HEADER_FILE = r'input_files\Header.xlsx'
+DATA_FILE = r'input_files\compact_revenue_report.csv'
+HOLD_FILE = r'input_files\Hold_list.csv'
+MM_FILE = r'input_files\MM.csv'
+RECOVERY_FILE = r'input_files\Recovery.csv'
+
+OUTPUT_FILE = r'output_files\output.xlsx'
+SUMMARY_FILE = r'output_files\payout_summary.xlsx'
+PAYMENT_SHEET_FILE = r'output_files\payment sheet.xlsx'
+CHECKLIST_FILE = r'output_files\checklist.xlsx'
+JV_WORKING_FILE = r'output_files\jv_working.xlsx'
+
+
+def process_revenue_report():
+    try:
+        # Create output folder
+        output_dir = os.path.dirname(OUTPUT_FILE)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        # 1. Load Header Template
+        header_df = pd.read_excel(HEADER_FILE)
+        template_headers = header_df.columns.tolist()
+
+        # 2. Load CSV Data
+        df = pd.read_csv(DATA_FILE, encoding='latin1', low_memory=False)
+
+        # Exclude specific MIDs
+        exclude_mids = [1530540, 1530543, 1530541, 870346]
+        df = df[~df['merchant_id'].isin(exclude_mids)]
+
+        # Helper
+        def to_num(cols, target_df=df):
+            for col in cols:
+                if col not in target_df.columns:
+                    target_df[col] = 0.0
+                target_df[col] = pd.to_numeric(target_df[col], errors='coerce').fillna(0)
+
+        # MID_WID logic
+        m_id = df['merchant_id'].astype(str)
+        w_id = df['warehouse_id'].fillna('').astype(str)
+        f_type = df['finance_key_type'].fillna('').astype(str)
+        df['MID_WID'] = np.where((f_type == 'default') | (f_type == ''), m_id, m_id + "_" + w_id)
+
+        # Status
+        dir_str = df['direction'].astype(str)
+        df['Status'] = np.select([(dir_str == '1'), (dir_str == '2')], ['Payout', 'Returned'], default='Unknown')
+
+        # GMV
+        to_num(['price', 'qty_ordered'])
+        base_gmv = (df['price'] * df['qty_ordered']).round(2)
+        df['GMV'] = np.where(dir_str == '1', base_gmv, np.where(dir_str == '2', -base_gmv, 0))
+
+        # Commission
+        comm_cols = [
+            'pg_commission', 'mp_commission', 'logistics_penalty', 'reverse_logistics_penalty',
+            'merchant_cancel_mp_penalty', 'merchant_cancel_pg_penalty', 'logistics',
+            'shipping_recovery_mp_fee', 'shipping_recovery_pg_fee', 'mp_commission_reversal',
+            'sla_breach_mp_penalty', 'marketing_fee', 'closing_fee', 'deal_setup_fees',
+            'partial_shipping_rev_pg_fee', 'partial_shipping_rev_mp_fee', 'pf_taxes_comm',
+            'pf_pac_comm', 'pf_scf_comm', 'pf_rev_tax_comm', 'pf_rev_pac_comm', 'pf_rev_scf_comm'
+        ]
+        to_num(comm_cols)
+        total_comm = df[comm_cols].sum(axis=1)
+
+        df['Commission'] = np.where(
+            dir_str == '1',
+            total_comm,
+            pd.to_numeric(df.get('commission', total_comm), errors='coerce').fillna(0)
+        ).round(2)
+
+        df['Tax'] = (total_comm * 0.18).round(2)
+
+        # More numeric fields
+        to_num([
+            'cust_shipping_reversal', 'partial_shipping_rev', 'mp_shipping', 'pf_tax', 'pf_packing',
+            'pf_seller_convenience', 'product_gst', 'product_igst', 'product_cgst', 'product_sgst',
+            'tcs_cgst', 'tcs_igst', 'tcs_sgst', 'shipping_tcs_cgst', 'shipping_tcs_igst',
+            'shipping_tcs_sgst', 'tds_ecom', 'merchant_payable'
+        ])
+
+        # New Calculated Columns
+        df['pf'] = ((df['pf_tax'] + df['pf_packing'] + df['pf_seller_convenience']) * -1).round(2)
+        df['product_gst'] = (df['product_igst'] + df['product_cgst'] + df['product_sgst']).round(2)
+        df['TCS'] = df[['tcs_cgst', 'tcs_igst', 'tcs_sgst',
+                        'shipping_tcs_cgst', 'shipping_tcs_igst', 'shipping_tcs_sgst']].sum(axis=1).round(2)
+        df['TDS'] = df['tds_ecom'].round(2)
+
+        df['Seller Payable'] = (
+            df['GMV'] - df['Commission'] - df['Tax'] - df['cust_shipping_reversal'] -
+            df['partial_shipping_rev'] - df['pf'] - df['product_gst'] -
+            df['TCS'] - df['TDS']
+        ).round(2)
+
+        df['Diff'] = (df['merchant_payable'] - df['Seller Payable']).round(2)
+
+        # Suffix 2 Mapping
+        if 'merchant_id_name' not in df.columns:
+            df['merchant_id_name'] = ''
+
+        df['merchant_id_name2'] = df['merchant_id_name'].astype(str)
+
+        add_delivery_src = 'additional_delivery_charges'
+        for col in df.columns:
+            if col.startswith('additional_delivery'):
+                add_delivery_src = col
+                break
+
+        to_num(['pg_payable', 'cod_payable', 'shipping_amount', add_delivery_src, 'cart_conv_fee'])
+
+        df['pg_payable2'] = df['pg_payable']
+        df['cod_payable2'] = df['cod_payable']
+        df['shipping_amount2'] = df['shipping_amount']
+        df['additional_delivery_charges2'] = df[add_delivery_src]
+        df['cart_conv_fee2'] = df['cart_conv_fee']
+        df['merchant_payable2'] = df['merchant_payable']
+
+        # Create payout summary
+        summary_sum_cols = [
+            'GMV', 'Commission', 'Tax', 'pf', 'product_gst', 'TCS', 'TDS',
+            'Seller Payable', 'Diff', 'pg_payable2', 'cod_payable2', 'shipping_amount2',
+            'additional_delivery_charges2', 'cart_conv_fee2',
+            'cust_shipping_reversal', 'partial_shipping_rev', 'mp_shipping', 'merchant_payable2'
+        ]
+
+        summary_df = df.groupby('MID_WID').agg({
+            'merchant_id_name2': 'first',
+            'merchant_id': 'first',
+            **{col: 'sum' for col in summary_sum_cols}
+        }).reset_index()
+
+        summary_df.to_excel(SUMMARY_FILE, index=False)
+
+        # Create payment sheet
+        payment_df = summary_df.copy()
+
+        # Hold Mapping & Duplicate Fix
+        if os.path.exists(MM_FILE):
+            mm_df = pd.read_csv(MM_FILE, encoding='latin1')
+            mm_df.columns = mm_df.columns.str.strip()
+            mm_df['MID_WID'] = mm_df['MID_WID'].astype(str).str.strip()
+            mm_df = mm_df.drop_duplicates(subset=["MID_WID"], keep="first")
+            payment_df = pd.merge(payment_df, mm_df[['MID_WID', 'SAP_New_Code', 'Nodal']], on='MID_WID', how='left')
+            payment_df.rename(columns={'SAP_New_Code': 'SAP', 'Nodal': 'Nodal_Status'}, inplace=True)
+        else:
+            payment_df['SAP'] = ""
+            payment_df['Nodal_Status'] = ""
+
+        if os.path.exists(HOLD_FILE):
+            hold_df = pd.read_csv(HOLD_FILE, encoding='latin1')
+            hold_df['MID_WID'] = hold_df['MID_WID'].astype(str)
+            hold_df['Hold_Flag'] = "Hold"
+            payment_df = pd.merge(payment_df, hold_df[['MID_WID', 'Hold_Flag']], on='MID_WID', how='left')
+            payment_df['Hold'] = payment_df['Hold_Flag'].fillna("")
+        else:
+            payment_df['Hold'] = ""
+
+        # Recovery Mapping
+        if os.path.exists(RECOVERY_FILE):
+            rec_df = pd.read_csv(RECOVERY_FILE, encoding='latin1')
+            rec_df['Merchant_ID'] = rec_df['Merchant_ID'].astype(str)
+            to_num(['TOTAL'], target_df=rec_df)
+            rec_grouped = rec_df.groupby('Merchant_ID')['TOTAL'].sum().reset_index()
+            payment_df['m_id_str'] = payment_df['merchant_id'].astype(str)
+            payment_df = pd.merge(payment_df, rec_grouped, left_on='m_id_str', right_on='Merchant_ID', how='left')
+            payment_df.rename(columns={'TOTAL': 'recovery'}, inplace=True)
+        else:
+            payment_df['recovery'] = 0
+
+        payment_df['recovery'] = pd.to_numeric(payment_df['recovery'], errors='coerce').fillna(0)
+
+        # Calculate Recovered_pg and Recovered_cod
+        payment_df['Recovered_pg'] = np.where(
+            payment_df['pg_payable2'] <= 0, 0, 
+            np.minimum(payment_df['pg_payable2'], payment_df['recovery'])
+        ) * -1
+
+        pending_after_pg = (payment_df['recovery'] - np.where(payment_df['pg_payable2'] > 0, payment_df['pg_payable2'], 0)).clip(lower=0)
+        
+        payment_df['Recovered_cod'] = np.where(
+            payment_df['cod_payable2'] <= 0, 0, 
+            np.minimum(payment_df['cod_payable2'], pending_after_pg)
+        ) * -1
+
+        # Net Payables Calculation
+        payment_df['net pg_payable'] = np.where(
+            (payment_df['Hold'] == "Hold") | (payment_df['Nodal_Status'].astype(str).str.isalpha()), 0,
+            (payment_df['pg_payable2'] - payment_df['recovery']).clip(lower=0)
+        ).round(2)
+
+        payment_df['pending_recovery'] = (payment_df['recovery'] - payment_df['pg_payable2']).clip(lower=0)
+
+        payment_df['net_cod_payable'] = np.where(
+            (payment_df['Hold'] == "Hold") | (payment_df['Nodal_Status'].astype(str).str.isalpha()), 0,
+            (payment_df['cod_payable2'] - payment_df['pending_recovery']).clip(lower=0)
+        ).round(2)
+
+        pay_headers = [
+            'MID_WID', 'SAP', 'merchant_id_name2', 'GMV', 'merchant_payable2',
+            'pg_payable2', 'cod_payable2', 'Hold', 'recovery',
+            'net pg_payable', 'net_cod_payable', 'Nodal_Status', 'Recovered_pg', 'Recovered_cod'
+        ]
+
+        payment_df[pay_headers].fillna("").to_excel(PAYMENT_SHEET_FILE, index=False)
+
+        # --- PREPARE FINAL OUTPUT COLUMNS ---
+        requested_cols = [
+            'pf', 'product_gst', 'TCS', 'TDS', 
+            'shipping_amount2', 'additional_delivery_charges2', 'cart_conv_fee2'
+        ]
+        
+        extra_cols = [
+            'MID_WID', 'Status', 'GMV', 'Commission', 'Tax', 
+            'Seller Payable', 'Diff', 'merchant_id_name2', 
+            'pg_payable2', 'cod_payable2'
+        ]
+        
+        final_export_cols = []
+        seen = set()
+        
+        for col in template_headers + extra_cols + requested_cols:
+            if col in df.columns and col not in seen:
+                final_export_cols.append(col)
+                seen.add(col)
+
+        df[final_export_cols].to_excel(OUTPUT_FILE, index=False)
+        print(f"✅ SUCCESS — All files generated.")
+
+        # --- NEW SECTION: JV WORKING GENERATION ---
+        generate_jv_working()
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+def generate_jv_working():
+    try:
+        print("Generating jv_working.xlsx...")
+        # 1. Load the generated output file and MM for SAP
+        out_df = pd.read_excel(OUTPUT_FILE)
+        mm_df = pd.read_csv(MM_FILE, encoding='latin1')
+        mm_df.columns = mm_df.columns.str.strip()
+        mm_df['MID_WID'] = mm_df['MID_WID'].astype(str).str.strip()
+        mm_df = mm_df.drop_duplicates(subset=["MID_WID"], keep="first")
+
+        # 2. Pivot GMV by direction
+        # Convert GMV to absolute for direction 2 so that 'direction_2' shows a positive value or keep as is? 
+        # Requirement says "sum of GMV", we'll keep the signs from the output.xlsx logic.
+        jv_pivot = pd.pivot_table(
+            out_df, 
+            values='GMV', 
+            index='MID_WID', 
+            columns='direction', 
+            aggfunc='sum'
+        ).reset_index()
+
+        # Rename columns as requested
+        jv_pivot = jv_pivot.rename(columns={1: 'direction_1', 2: 'direction_2'})
+        
+        # Ensure columns exist even if one direction is missing in the data
+        if 'direction_1' not in jv_pivot.columns: jv_pivot['direction_1'] = 0
+        if 'direction_2' not in jv_pivot.columns: jv_pivot['direction_2'] = 0
+        
+        jv_pivot['direction_1'] = jv_pivot['direction_1'].fillna(0)
+        jv_pivot['direction_2'] = jv_pivot['direction_2'].fillna(0)
+
+        # 3. Add SAP column from MM.csv
+        jv_pivot['MID_WID_STR'] = jv_pivot['MID_WID'].astype(str)
+        jv_pivot = pd.merge(jv_pivot, mm_df[['MID_WID', 'SAP_New_Code']], left_on='MID_WID_STR', right_on='MID_WID', how='left')
+        jv_pivot.rename(columns={'SAP_New_Code': 'SAP'}, inplace=True)
+
+        # 4. Calculate Total
+        jv_pivot['Total'] = jv_pivot['direction_1'] + jv_pivot['direction_2']
+
+        # Select final 5 columns
+        final_jv = jv_pivot[['MID_WID_x', 'SAP', 'direction_1', 'direction_2', 'Total']]
+        final_jv = final_jv.rename(columns={'MID_WID_x': 'MID_WID'})
+
+        final_jv.to_excel(JV_WORKING_FILE, index=False)
+        print(f"✅ JV Working file saved: {JV_WORKING_FILE}")
+
+    except Exception as e:
+        print(f"❌ JV Working Error: {e}")
+
+
+if __name__ == "__main__":
+    process_revenue_report()
+    create_checklist_pivot(OUTPUT_FILE, CHECKLIST_FILE)
+    send_gmail()
